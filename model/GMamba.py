@@ -787,23 +787,22 @@ class GASSM(nn.Module):
     def forward_corev0(self, x: torch.Tensor, mask: torch.Tensor,to_dtype=False, channel_first=False):
         selective_scan = selective_scan_fn
 
-        # 维度转换保持原样
         if not channel_first:
             x = x.permute(0, 3, 1, 2).contiguous()
-        # ================== 动态窗口划分 ==================
+        
         _, _, orH, orW = x.shape
         H = orH
         W = orW
         ws = 8
         H_pad = (H + ws - 1) // ws * ws
         W_pad = (W + ws - 1) // ws * ws
-        x = F.pad(x, (0, W_pad - W, 0, H_pad - H))  # 确保可整除
+        x = F.pad(x, (0, W_pad - W, 0, H_pad - H))  
         mask = F.pad(mask, (0, W_pad - W, 0, H_pad - H))
-        # 窗口参数（关键修正点）
+       
         num_win_h = H_pad // ws
         num_win_w = W_pad // ws
 
-        num_win = num_win_h * num_win_w  # 动态计算窗口总数
+        num_win = num_win_h * num_win_w  
         B, D, H, W = x.shape
         D, N = self.A_logs.shape
         L = H * W
@@ -811,16 +810,12 @@ class GASSM(nn.Module):
         x_hwwh = torch.stack([x.view(B, D, L), x.permute(0, 1, 3, 2).contiguous().view(B, D, L)], dim=1)
         global_scans = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1)
 
-        # ================== 全局扫描路径 ==================
-        # 原始全局扫描路径生成（保持原有代码）
        
-
-        # ================== 窗口化局部处理 ==================
         x_windows = x.unfold(2, ws, ws).unfold(3, ws, ws).contiguous().view(B, D, -1, ws * ws)
 
         def contrast_enhancement_torch(image_tensor):
 
-            assert image_tensor.shape[1] == 1, "图像必须是单通道图像"
+            assert image_tensor.shape[1] == 1, 
 
             image_tensor = (image_tensor - image_tensor.min()) / (image_tensor.max() - image_tensor.min() + 1e-10)
 
@@ -830,8 +825,6 @@ class GASSM(nn.Module):
 
             return image_tensor
 
-
-        # 获取梯度
         def get_gradient(map):
             sobel_x = F.conv2d(map, torch.tensor([[[[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]]], dtype=torch.float32,
                                                  device=x.device), padding=1)
@@ -843,8 +836,6 @@ class GASSM(nn.Module):
         gx, gy = get_gradient(mask)
 
 
-
-        # 计算窗口梯度方向
         def get_window_direction(win_grad):
             B = win_grad.size(0)
             num_win = (win_grad.size(2) * win_grad.size(3))
@@ -853,37 +844,32 @@ class GASSM(nn.Module):
             dir_idx = torch.mode(((angles + np.pi) // (np.pi / 4)).long(), dim=2)[0] % 4
             return F.one_hot(dir_idx, 4).permute(0, 2, 1)
 
-        # 获取窗口方向掩码
         win_grad = torch.stack([gx, gy], dim=-1)  # (B,1,H,W,2)
 
         win_grad = win_grad.unfold(2, ws, ws).unfold(3, ws, ws).permute(0, 1, 2, 3, 5, 6, 4)
 
         win_dir_mask = get_window_direction(win_grad)
 
-
         local_scans = []
         for d in range(4):
-            # # 方向门控
-            #
+            
             masked_wins = x_windows * win_dir_mask[:, d].view(B, 1, num_win, 1)
-            # 行扫描
+            
             row_scans = masked_wins.view(B, D, -1)
-            # 列扫描
+            
             col_scans = masked_wins.permute(0, 1, 3, 2).contiguous().view(B, D, -1)
             local_scans.extend([row_scans, col_scans])
 
         local_scans = torch.stack(local_scans, dim=1)
 
         local_scans = torch.cat([local_scans, torch.flip(local_scans, dims=[-1])], dim=1)
-        # 5. 窗口扫描重组
+       
         local_scans = local_scans.view(B, ws, D, -1, ws * ws).permute(0, 1, 3, 2, 4)
 
         local_scans = local_scans.contiguous().view(B, -1, D, L)
 
-
         combined_scans = torch.cat([global_scans, local_scans], dim=1)  # (B,4+K,D,L)
 
-        # ================== 后续处理 ==================
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", combined_scans, self.x_proj_weight)
         dts, Bs, Cs = torch.split(x_dbl, [R, N, N], dim=2)
         dts = torch.einsum("b k r l, k d r -> b k d l", dts, self.dt_projs_weight)
@@ -891,7 +877,6 @@ class GASSM(nn.Module):
         xs = combined_scans.float().view(B, -1, L)
         dts = dts.contiguous().float().view(B, -1, L)
 
-        # 选择性扫描
         out_y = selective_scan(
             xs, dts,
             -torch.exp(self.A_logs.float()),
@@ -901,8 +886,7 @@ class GASSM(nn.Module):
             delta_softplus=True,
         ).view(B, -1, D, L)  # (B,K,D,L)
 
-        # ================== 特征融合 ==================
-        # 全局分量（原始4个扫描）
+       
         def similarity_matching(global_y, local_y):
    
             B, D, L = global_y.shape
@@ -927,7 +911,6 @@ class GASSM(nn.Module):
 
         local_combined = []
         local_y = out_y[:, 4:]
-
         dynamic_weights = self.dynamic_weights
         for d in range(4):
 
@@ -958,7 +941,7 @@ class GASSM(nn.Module):
                        cross_selective_scan=cross_selective_scan, force_fp32=None):
         if not channel_first:
             x = x.permute(0, 3, 1, 2).contiguous()
-        # ZSJ V2版本使用的mamba，要改扫描方向在这里改
+        
         x = cross_selective_scan(
             x, self.x_proj_weight, None, self.dt_projs_weight, self.dt_projs_bias,
             self.A_logs, self.Ds, delta_softplus=True,
